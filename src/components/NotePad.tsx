@@ -3,6 +3,7 @@ import type { MouseEvent } from "react";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { createNote, getErrorMessage, getNote, listNotes, updateNote } from "../features/notes/api";
+import { showToast } from "./Toast";
 import type { Note, NoteMetadata } from "../features/notes/types";
 import {
   countNoteChars,
@@ -120,7 +121,6 @@ export function NotePad({
   const [content, setContent] = useState("");
   const [hoveredNote, setHoveredNote] = useState<string | null>(null);
   const [status, setStatus] = useState<NotePadStatus>("empty");
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [noteSurfaceAutoSave, setNoteSurfaceAutoSave] = useState(initialAutoSave);
   const [tileColorRaw, setTileColorRaw] = useState(normalizeTileColor(initialTileColor));
   const [tileColorMode, setTileColorMode] = useState<TileColorMode>("system");
@@ -192,7 +192,7 @@ export function NotePad({
           if (!cancelled) applyNote(note);
         }
       } catch (error) {
-        if (!cancelled) setErrorMessage(getErrorMessage(error));
+        if (!cancelled) showToast(getErrorMessage(error));
       }
     }
 
@@ -280,7 +280,6 @@ export function NotePad({
       setContent("");
       setMode("new");
       setStatus("empty");
-      setErrorMessage(null);
       setIsExiting(false);
       setSurfaceMode("pad");
       void refreshNotes().catch(() => undefined);
@@ -336,7 +335,7 @@ export function NotePad({
         const currentBounds = await getCurrentWindowBounds();
         await animateCurrentWindowBounds(getSurfaceTargetBounds(nextMode, currentBounds));
       } catch (error) {
-        setErrorMessage(getErrorMessage(error));
+        showToast(getErrorMessage(error));
       }
     },
     [surfaceMode, tileNoteId],
@@ -361,12 +360,11 @@ export function NotePad({
   }, [surfaceMode]);
 
   const handleSave = useCallback(async () => {
-    setErrorMessage(null);
     try {
       await saveNote();
     } catch (error) {
       setStatus("saveFailed");
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   }, [saveNote]);
 
@@ -383,25 +381,23 @@ export function NotePad({
   }, [handleSave]);
 
   const handleOpenNote = async (noteId: string) => {
-    setErrorMessage(null);
     try {
       const note = await getNote(noteId);
       applyNote(note);
       await switchSurfaceMode("pad");
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
   const handlePin = async () => {
-    setErrorMessage(null);
     try {
       if (shouldSaveBeforeSwitchingToTile(noteSurfaceAutoSave)) {
         await saveNote();
       }
       await switchSurfaceMode("tile");
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -410,12 +406,11 @@ export function NotePad({
     const closeSurface = surfaceMode === "tile" ? closeCurrentWindow : recycleCurrentNotepad;
     void closeSurface().catch((error) => {
       setIsExiting(false);
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     });
   }, [surfaceMode]);
 
   const copyTileContent = useCallback(async () => {
-    setErrorMessage(null);
     try {
       const clipboard = navigator.clipboard;
       if (!clipboard?.writeText) {
@@ -424,7 +419,7 @@ export function NotePad({
       await clipboard.writeText(content);
       setStatus("copied");
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   }, [content, t]);
 
@@ -482,7 +477,6 @@ export function NotePad({
     setContent("");
     setMode("new");
     setStatus("empty");
-    setErrorMessage(null);
   };
 
   const isTile = surfaceMode === "tile";
@@ -497,10 +491,10 @@ export function NotePad({
       {isTile ? (
         <Tile
           title={tileTitle || undefined}
-          content={errorMessage || content}
+          content={content}
           color={tileColor}
           fontSize={surfaceFontSize}
-          renderMarkdown={!errorMessage && tileRenderMarkdown}
+          renderMarkdown={tileRenderMarkdown}
           width="100%"
           className="h-full cursor-default"
           data-surface-mode={surfaceMode}
@@ -660,8 +654,7 @@ export function NotePad({
 
                 <div className="flex items-center justify-between mt-auto pt-2 border-t border-paper-deep/30 shrink-0">
                   <span className="text-[11px] text-ink-ghost font-mono tabular-nums truncate max-w-[170px]">
-                    {errorMessage ??
-                      `${countNoteChars(content)} ${t("common.wordCountUnit", { defaultValue: "字" })} · ${statusLabel[status]}`}
+                    {`${countNoteChars(content)} ${t("common.wordCountUnit", { defaultValue: "字" })} · ${statusLabel[status]}`}
                   </span>
                   <div className="flex items-center gap-2">
                     <button
