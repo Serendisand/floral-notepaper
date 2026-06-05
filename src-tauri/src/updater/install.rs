@@ -175,6 +175,12 @@ where
         let log_path_text = request.command.log_path.to_string_lossy().to_string();
         let install_mode = install_mode(self.helper_mode);
         let started_at = Utc::now();
+        if self.helper_mode == helper::UpdateHelperMode::Apply {
+            state::save(
+                paths,
+                &scheduled_state(&current_state, &request, install_mode.clone(), started_at),
+            )?;
+        }
         debug_log!("启动 helper 进程 mode={:?}", self.helper_mode);
         match self.executor.execute(&request) {
             Ok(_) => {
@@ -200,10 +206,12 @@ where
                     });
                 }
 
-                state::save(
-                    paths,
-                    &scheduled_state(&current_state, &request, install_mode.clone(), started_at),
-                )?;
+                if let Some(error) =
+                    load_current_install_failure(paths, &current_state.current_version, &request)
+                {
+                    debug_log!("helper 已在退出前失败 code={}", error.code);
+                    return Err(error);
+                }
                 debug_log!("安装已调度，等待退出");
                 Ok(UpdateInstallResult {
                     status: UpdateStatus::InstallScheduled,
@@ -841,15 +849,34 @@ fn install_failure_action(code: &str) -> &'static str {
     }
 }
 
+fn load_current_install_failure(
+    paths: &UpdatePaths,
+    current_version: &str,
+    request: &HelperLaunchRequest,
+) -> Option<AppError> {
+    let log_path = request.command.log_path.to_string_lossy().to_string();
+    let saved_state = state::load_with_current_version(paths, current_version).ok()?;
+    if saved_state.status != UpdateStatus::Failed {
+        return None;
+    }
+    if saved_state.install_log_path.as_deref() != Some(log_path.as_str()) {
+        return None;
+    }
+    let error = saved_state.last_error?;
+    Some(errors::app_error(error.code, error.message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::updater::settings::write_json_atomic;
     use crate::updater::types::{DownloadSourceUsed, UpdateChannel};
     use std::{fs, sync::Arc};
 
     #[derive(Debug, Clone)]
     enum FakeExecutorResult {
         Success,
+        PersistFailedStateThenSuccess,
         Error(AppError),
     }
 
@@ -877,6 +904,26 @@ mod tests {
             self.calls.lock().expect("calls lock").push(request.clone());
             match &self.result {
                 FakeExecutorResult::Success => Ok(HelperLaunchOutcome),
+                FakeExecutorResult::PersistFailedStateThenSuccess => {
+                    let failed_state = UpdateStateDto {
+                        status: UpdateStatus::Failed,
+                        current_version: request.command.current_version.clone(),
+                        latest_version: Some(request.command.target_version.clone()),
+                        install_log_path: Some(
+                            request.command.log_path.to_string_lossy().to_string(),
+                        ),
+                        install_mode: Some(UpdateInstallMode::Apply),
+                        last_error: Some(UpdateErrorDto::recoverable(
+                            "updateInstallInstallerFailed",
+                            "更新安装程序执行失败",
+                            Some("retryInstall".into()),
+                        )),
+                        ..UpdateStateDto::idle_with_version(request.command.current_version.clone())
+                    };
+                    write_json_atomic(&request.command.state_path, &failed_state)
+                        .expect("persist failed helper state");
+                    Ok(HelperLaunchOutcome)
+                }
                 FakeExecutorResult::Error(error) => Err(error.clone()),
             }
         }
@@ -1119,6 +1166,37 @@ mod tests {
         let saved = state::load(&paths).expect("load failed state");
         assert_eq!(error.code, "updateInstallSpawnFailed");
         assert_eq!(saved.status, UpdateStatus::Failed);
+    }
+
+    #[test]
+    fn surfaces_helper_failure_written_before_handoff_completes() {
+        let paths = test_paths("install-helper-prehandoff-failure");
+        paths.ensure_dirs().expect("ensure dirs");
+        let bundle = paths.root_dir().join("Floral Notepaper.app");
+        write_bundle_with_helper(&bundle);
+        let app_binary = bundle
+            .join("Contents")
+            .join("MacOS")
+            .join("floral-notepaper");
+        let executor = FakeExecutor::new(FakeExecutorResult::PersistFailedStateThenSuccess);
+        let service = UpdateInstallService::with_executor(
+            executor,
+            helper::UpdateHelperMode::Apply,
+            Some(app_binary),
+            Some(platform_with_bundle(&bundle)),
+        );
+
+        let error = service
+            .run(&paths, downloaded_state(&paths))
+            .expect_err("persisted helper failure should surface");
+
+        let saved = state::load(&paths).expect("load failed state");
+        assert_eq!(error.code, "updateInstallInstallerFailed");
+        assert_eq!(saved.status, UpdateStatus::Failed);
+        assert_eq!(
+            saved.last_error.as_ref().map(|error| error.code.as_str()),
+            Some("updateInstallInstallerFailed")
+        );
     }
 
     #[test]

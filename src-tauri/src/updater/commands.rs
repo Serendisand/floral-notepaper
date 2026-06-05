@@ -229,12 +229,16 @@ pub async fn update_install(
 
     match result {
         Ok(install_result) => {
+            let mut should_terminate = install_result.mode == UpdateInstallMode::Apply;
             if let Ok(next_state) = state.load_state() {
+                if next_state.status == UpdateStatus::Failed {
+                    should_terminate = false;
+                }
                 if let Err(error) = app.emit("update://install-finished", &next_state) {
                     eprintln!("failed to emit update://install-finished: {error}");
                 }
             }
-            if install_result.mode == UpdateInstallMode::Apply {
+            if should_terminate {
                 desktop::mark_app_exiting(&app);
                 schedule_force_terminate_self();
             }

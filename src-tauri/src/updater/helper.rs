@@ -19,6 +19,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(all(test, not(target_os = "windows")))]
+fn normalize_windows_path(value: &str) -> String {
+    value.replace('/', "\\").to_ascii_lowercase()
+}
+
 #[cfg(target_os = "windows")]
 pub const HELPER_BINARY_NAME: &str = "floral-notepaper-update-helper.exe";
 #[cfg(not(target_os = "windows"))]
@@ -101,13 +106,51 @@ enum InstallRollbackPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowsRollbackPlan {
     target_path: PathBuf,
+    install_dir: PathBuf,
+    backup_dir: PathBuf,
+    registry_backup: Option<WindowsRegistryRollbackPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsRegistryRollbackPlan {
+    key_path: String,
     backup_path: PathBuf,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsRegistryInstallRecord {
+    key_path: String,
+    launch_target: Option<PathBuf>,
+    install_dir: Option<PathBuf>,
+    quiet_uninstall_command: Option<String>,
+    uninstall_command: Option<String>,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsRegistryEntry {
+    key_path: String,
+    values: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiskSpaceRequirement {
+    probe_path: PathBuf,
+    required_bytes: u64,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AggregatedDiskSpaceRequirement {
+    probe_path: PathBuf,
+    required_bytes: u64,
+    reasons: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatchdogPostExitAction {
     Noop,
-    RelaunchWithoutFailure,
     MarkFailedAndRelaunch,
 }
 
@@ -394,7 +437,6 @@ fn execute_watchdog(
 
     match watchdog_post_exit_action(command, log)? {
         WatchdogPostExitAction::Noop => Ok(()),
-        WatchdogPostExitAction::RelaunchWithoutFailure => relaunch_existing_target(command, log),
         WatchdogPostExitAction::MarkFailedAndRelaunch => {
             let persist_result =
                 persist_failed_state(command, UpdateHelperExitCode::InstallerFailed, log);
@@ -426,11 +468,11 @@ fn watchdog_post_exit_action(
         write_log_line(
             log,
             &format!(
-                "update helper reached relaunch handoff without completion marker; relaunching target without marking failed ({})",
+                "update helper reached relaunch handoff without completion marker; treating handoff as successful to avoid duplicate relaunch ({})",
                 relaunch_path.display()
             ),
         )?;
-        return Ok(WatchdogPostExitAction::RelaunchWithoutFailure);
+        return Ok(WatchdogPostExitAction::Noop);
     }
 
     write_log_line(
@@ -601,25 +643,98 @@ fn ensure_sufficient_disk_space(
     command: &UpdateHelperCommand,
     log: &mut File,
 ) -> Result<(), UpdateHelperExitCode> {
-    let Some(target_dir) = command.target_path.parent() else {
-        return Ok(());
-    };
-    let Some(available_bytes) = available_disk_space(target_dir) else {
-        return Ok(());
-    };
+    let requirements = aggregated_disk_space_requirements(command, log)?;
+    for requirement in requirements.values() {
+        let Some(available_bytes) = available_disk_space(&requirement.probe_path) else {
+            continue;
+        };
+        if available_bytes >= requirement.required_bytes {
+            continue;
+        }
 
-    let required_bytes = command.asset_size.saturating_mul(2);
-    if available_bytes < required_bytes {
         write_log_line(
             log,
             &format!(
-                "insufficient disk space: required {required_bytes} bytes, available {available_bytes} bytes"
+                "insufficient disk space at {}: required {} bytes, available {} bytes ({})",
+                requirement.probe_path.display(),
+                requirement.required_bytes,
+                available_bytes,
+                requirement.reasons.join(" + "),
             ),
         )?;
         return Err(UpdateHelperExitCode::InsufficientSpace);
     }
 
     Ok(())
+}
+
+fn aggregated_disk_space_requirements(
+    command: &UpdateHelperCommand,
+    log: &mut File,
+) -> Result<BTreeMap<String, AggregatedDiskSpaceRequirement>, UpdateHelperExitCode> {
+    let mut aggregated = BTreeMap::<String, AggregatedDiskSpaceRequirement>::new();
+
+    for requirement in disk_space_requirements(command, log)? {
+        let bucket = storage_bucket_key(&requirement.probe_path)
+            .unwrap_or_else(|| fallback_bucket_key(&requirement.probe_path));
+        let entry = aggregated
+            .entry(bucket)
+            .or_insert_with(|| AggregatedDiskSpaceRequirement {
+                probe_path: requirement.probe_path.clone(),
+                required_bytes: 0,
+                reasons: Vec::new(),
+            });
+        entry.required_bytes = entry
+            .required_bytes
+            .saturating_add(requirement.required_bytes);
+        if !entry.reasons.contains(&requirement.reason) {
+            entry.reasons.push(requirement.reason);
+        }
+    }
+
+    Ok(aggregated)
+}
+
+fn disk_space_requirements(
+    command: &UpdateHelperCommand,
+    log: &mut File,
+) -> Result<Vec<DiskSpaceRequirement>, UpdateHelperExitCode> {
+    let mut requirements = Vec::new();
+
+    if let Some(target_dir) = command.target_path.parent() {
+        requirements.push(DiskSpaceRequirement {
+            probe_path: existing_probe_path(target_dir),
+            required_bytes: command.asset_size.saturating_mul(2),
+            reason: "installer workspace",
+        });
+    }
+
+    if command.install_kind == InstallKind::WindowsNsis {
+        let Some(install_dir) = command.target_path.parent() else {
+            return Ok(requirements);
+        };
+        let Some(backup_parent) = command.ready_path.parent() else {
+            return Err(UpdateHelperExitCode::ReplacementFailed);
+        };
+        let backup_bytes = directory_size_bytes(install_dir).map_err(|error| {
+            let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
+            let _ = write_log_line(
+                log,
+                &format!(
+                    "failed to measure Windows install directory for rollback sizing {} ({error})",
+                    install_dir.display()
+                ),
+            );
+            code
+        })?;
+        requirements.push(DiskSpaceRequirement {
+            probe_path: existing_probe_path(backup_parent),
+            required_bytes: backup_bytes,
+            reason: "Windows rollback backup",
+        });
+    }
+
+    Ok(requirements)
 }
 
 fn apply_update(
@@ -728,14 +843,20 @@ fn install_windows_installer(
 
     let exe_link = if extension.is_empty() || !matches!(extension.as_str(), "exe" | "msi") {
         let link_path = command.asset_path.with_extension("exe");
-        if let Err(error) = fs::hard_link(&command.asset_path, &link_path)
-            .or_else(|_| fs::copy(&command.asset_path, &link_path).map(|_| ()))
-        {
+        let link_result = fs::hard_link(&command.asset_path, &link_path).or_else(|link_error| {
+            fs::copy(&command.asset_path, &link_path)
+                .map(|_| ())
+                .map_err(|copy_error| (link_error, copy_error))
+        });
+        if let Err((link_error, copy_error)) = link_result {
+            let code = map_copy_error_code(&copy_error, UpdateHelperExitCode::AssetExtractFailed);
             write_log_line(
                 log,
-                &format!("failed to create .exe link for extensionless asset: {error}"),
+                &format!(
+                    "failed to create .exe link for extensionless asset: hard_link={link_error}; copy={copy_error}"
+                ),
             )?;
-            return Err(UpdateHelperExitCode::AssetExtractFailed);
+            return Err(code);
         }
         write_log_line(
             log,
@@ -834,29 +955,50 @@ fn prepare_windows_rollback_plan(
     command: &UpdateHelperCommand,
     log: &mut File,
 ) -> Result<WindowsRollbackPlan, UpdateHelperExitCode> {
+    let install_dir = command
+        .target_path
+        .parent()
+        .ok_or(UpdateHelperExitCode::ReplacementFailed)?
+        .to_path_buf();
     let backup_parent = command
         .ready_path
         .parent()
         .ok_or(UpdateHelperExitCode::ReplacementFailed)?;
-    let backup_path = unique_temp_path(backup_parent, "windows-rollback", Some("exe"));
-    fs::copy(&command.target_path, &backup_path).map_err(|error| {
+    let registry_backup = backup_windows_registry_state(command, backup_parent, log)?;
+    let backup_dir = unique_temp_path(backup_parent, "windows-rollback", Some("dir"));
+    fs::create_dir_all(&backup_dir).map_err(|error| {
+        let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
+        let _ = write_log_line(
+            log,
+            &format!(
+                "failed to create Windows rollback backup directory {} ({error})",
+                backup_dir.display()
+            ),
+        );
+        code
+    })?;
+    copy_dir_recursive(&install_dir, &backup_dir).map_err(|error| {
+        let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
         let _ = write_log_line(
             log,
             &format!(
                 "failed to stage Windows rollback backup {} -> {} ({error})",
-                command.target_path.display(),
-                backup_path.display()
+                install_dir.display(),
+                backup_dir.display()
             ),
         );
-        UpdateHelperExitCode::ReplacementFailed
+        let _ = fs::remove_dir_all(&backup_dir);
+        code
     })?;
     write_log_line(
         log,
-        &format!("staged Windows rollback backup {}", backup_path.display()),
+        &format!("staged Windows rollback backup {}", backup_dir.display()),
     )?;
     Ok(WindowsRollbackPlan {
         target_path: command.target_path.clone(),
-        backup_path,
+        install_dir,
+        backup_dir,
+        registry_backup,
     })
 }
 
@@ -1393,7 +1535,8 @@ fn resolve_windows_launch_target(
         )?;
         return Err(UpdateHelperExitCode::InstallerVersionMismatch);
     };
-    let resolved = query_windows_install_target_from_registry(exe_name);
+    let resolved = query_windows_install_record_from_registry(exe_name, Some(target_path))
+        .and_then(|record| record.launch_target);
     if let Some(path) = resolved.as_ref() {
         write_log_line(
             log,
@@ -1423,7 +1566,90 @@ fn resolve_windows_launch_target(
 }
 
 #[cfg(target_os = "windows")]
-fn query_windows_install_target_from_registry(exe_name: &str) -> Option<PathBuf> {
+fn backup_windows_registry_state(
+    command: &UpdateHelperCommand,
+    backup_parent: &Path,
+    log: &mut File,
+) -> Result<Option<WindowsRegistryRollbackPlan>, UpdateHelperExitCode> {
+    let Some(exe_name) = command
+        .target_path
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return Ok(None);
+    };
+    let Some(record) =
+        query_windows_install_record_from_registry(exe_name, Some(&command.target_path))
+    else {
+        write_log_line(
+            log,
+            &format!(
+                "no Windows uninstall registry entry matched {}; file rollback only",
+                command.target_path.display()
+            ),
+        )?;
+        return Ok(None);
+    };
+
+    let backup_path = unique_temp_path(backup_parent, "windows-registry-rollback", Some("reg"));
+    let status = Command::new(reg_exe_path())
+        .args([
+            "export",
+            &record.key_path,
+            &backup_path.to_string_lossy(),
+            "/y",
+        ])
+        .status()
+        .map_err(|error| {
+            let _ = write_log_line(
+                log,
+                &format!(
+                    "failed to export Windows uninstall registry key {} to {} ({error})",
+                    record.key_path,
+                    backup_path.display()
+                ),
+            );
+            UpdateHelperExitCode::ReplacementFailed
+        })?;
+    if !status.success() {
+        write_log_line(
+            log,
+            &format!(
+                "reg export failed for Windows uninstall registry key {} with status {:?}",
+                record.key_path,
+                status.code()
+            ),
+        )?;
+        return Err(UpdateHelperExitCode::ReplacementFailed);
+    }
+    write_log_line(
+        log,
+        &format!(
+            "exported Windows uninstall registry key {} to {}",
+            record.key_path,
+            backup_path.display()
+        ),
+    )?;
+    Ok(Some(WindowsRegistryRollbackPlan {
+        key_path: record.key_path,
+        backup_path,
+    }))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn backup_windows_registry_state(
+    _command: &UpdateHelperCommand,
+    _backup_parent: &Path,
+    _log: &mut File,
+) -> Result<Option<WindowsRegistryRollbackPlan>, UpdateHelperExitCode> {
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_install_record_from_registry(
+    exe_name: &str,
+    expected_target_path: Option<&Path>,
+) -> Option<WindowsRegistryInstallRecord> {
     const ROOTS: [&str; 4] = [
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall",
         r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -1432,13 +1658,20 @@ fn query_windows_install_target_from_registry(exe_name: &str) -> Option<PathBuf>
     ];
 
     ROOTS.iter().find_map(|root| {
-        Command::new(reg_exe_path())
+        let key_path = Command::new(reg_exe_path())
             .args(["query", root, "/s", "/f", exe_name])
             .output()
             .ok()
             .filter(|output| output.status.success())
             .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|output| parse_windows_install_target_from_registry_output(&output, exe_name))
+            .and_then(|output| {
+                parse_windows_install_registry_key_from_search_output(
+                    &output,
+                    exe_name,
+                    expected_target_path,
+                )
+            })?;
+        query_windows_install_registry_record(&key_path, exe_name, expected_target_path)
     })
 }
 
@@ -1452,47 +1685,244 @@ fn reg_exe_path() -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-fn parse_windows_install_target_from_registry_output(
+fn query_windows_install_registry_record(
+    key_path: &str,
+    exe_name: &str,
+    expected_target_path: Option<&Path>,
+) -> Option<WindowsRegistryInstallRecord> {
+    Command::new(reg_exe_path())
+        .args(["query", key_path])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| {
+            parse_windows_install_registry_record_output(&output, exe_name, expected_target_path)
+        })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_install_registry_key_from_search_output(
     output: &str,
     exe_name: &str,
-) -> Option<PathBuf> {
-    for line in output.lines() {
-        let normalized = line.trim();
-        if normalized.is_empty() {
-            continue;
-        }
-        if let Some(value) = registry_value_from_line(normalized) {
-            let candidate = PathBuf::from(value.trim_matches('"'));
-            if candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case(exe_name))
-                && candidate.exists()
-            {
-                return Some(candidate);
-            }
-            if candidate.exists() && candidate.is_dir() {
-                let joined = candidate.join(exe_name);
-                if joined.exists() {
-                    return Some(joined);
+    expected_target_path: Option<&Path>,
+) -> Option<String> {
+    parse_windows_registry_entries(output)
+        .into_iter()
+        .find(|entry| registry_entry_matches_installation(entry, exe_name, expected_target_path))
+        .map(|entry| entry.key_path)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_install_registry_record_output(
+    output: &str,
+    exe_name: &str,
+    expected_target_path: Option<&Path>,
+) -> Option<WindowsRegistryInstallRecord> {
+    let entry = parse_windows_registry_entries(output).into_iter().next()?;
+    let mut launch_target = None;
+    let mut install_dir = None;
+    let mut quiet_uninstall_command = None;
+    let mut uninstall_command = None;
+
+    for (name, value) in &entry.values {
+        match name.to_ascii_lowercase().as_str() {
+            "displayicon" | "installlocation" | "installdir" => {
+                if launch_target.is_none() {
+                    launch_target = registry_candidate_launch_target(value, exe_name);
+                }
+                if install_dir.is_none() {
+                    install_dir = registry_candidate_install_dir(value, exe_name);
                 }
             }
+            "quietuninstallstring" => quiet_uninstall_command = Some(value.clone()),
+            "uninstallstring" => uninstall_command = Some(value.clone()),
+            _ => {}
         }
+    }
+    if launch_target.is_none() {
+        launch_target = install_dir.as_ref().map(|dir| dir.join(exe_name));
+    }
+
+    let record = WindowsRegistryInstallRecord {
+        key_path: entry.key_path,
+        launch_target,
+        install_dir,
+        quiet_uninstall_command,
+        uninstall_command,
+    };
+    registry_record_matches_installation(&record, expected_target_path).then_some(record)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_registry_entries(output: &str) -> Vec<WindowsRegistryEntry> {
+    let mut entries = Vec::new();
+    let mut current_key = None::<String>;
+    let mut current_values = Vec::<(String, String)>::new();
+
+    let flush = |entries: &mut Vec<WindowsRegistryEntry>,
+                 current_key: &mut Option<String>,
+                 current_values: &mut Vec<(String, String)>| {
+        if let Some(key_path) = current_key.take() {
+            entries.push(WindowsRegistryEntry {
+                key_path,
+                values: std::mem::take(current_values),
+            });
+        }
+    };
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("HKEY_") {
+            flush(&mut entries, &mut current_key, &mut current_values);
+            current_key = Some(trimmed.to_string());
+            continue;
+        }
+        if current_key.is_some() {
+            if let Some(entry) = registry_value_entry_from_line(trimmed) {
+                current_values.push(entry);
+            }
+        }
+    }
+    flush(&mut entries, &mut current_key, &mut current_values);
+    entries
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn registry_entry_matches_installation(
+    entry: &WindowsRegistryEntry,
+    exe_name: &str,
+    expected_target_path: Option<&Path>,
+) -> bool {
+    let record = WindowsRegistryInstallRecord {
+        key_path: entry.key_path.clone(),
+        launch_target: entry
+            .values
+            .iter()
+            .find_map(|(_, value)| registry_candidate_launch_target(value, exe_name)),
+        install_dir: entry
+            .values
+            .iter()
+            .find_map(|(_, value)| registry_candidate_install_dir(value, exe_name)),
+        quiet_uninstall_command: entry
+            .values
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("QuietUninstallString"))
+            .map(|(_, value)| value.clone()),
+        uninstall_command: entry
+            .values
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("UninstallString"))
+            .map(|(_, value)| value.clone()),
+    };
+    registry_record_matches_installation(&record, expected_target_path)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn registry_record_matches_installation(
+    record: &WindowsRegistryInstallRecord,
+    expected_target_path: Option<&Path>,
+) -> bool {
+    let Some(expected_target_path) = expected_target_path else {
+        return record.launch_target.is_some() || record.install_dir.is_some();
+    };
+    let expected_path = normalize_windows_path(&expected_target_path.to_string_lossy());
+    let expected_dir = expected_target_path
+        .parent()
+        .map(|path| normalize_windows_path(&path.to_string_lossy()));
+
+    if record
+        .launch_target
+        .as_ref()
+        .is_some_and(|path| normalize_windows_path(&path.to_string_lossy()) == expected_path)
+    {
+        return true;
+    }
+    record.install_dir.as_ref().is_some_and(|path| {
+        expected_dir.as_ref().is_some_and(|expected_dir| {
+            normalize_windows_path(&path.to_string_lossy()) == *expected_dir
+        })
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn registry_value_entry_from_line(line: &str) -> Option<(String, String)> {
+    let (name, value) = line
+        .split_once("REG_EXPAND_SZ")
+        .or_else(|| line.split_once("REG_SZ"))
+        .map(|(name, value)| (name.trim(), value.trim()))
+        .filter(|(_, value)| !value.is_empty())?;
+    let name = name
+        .split_whitespace()
+        .last()
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some((name, expand_windows_env_vars(value)))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn registry_candidate_launch_target(value: &str, exe_name: &str) -> Option<PathBuf> {
+    let candidate = registry_path_text_candidate(value);
+    if windows_path_basename(&candidate).is_some_and(|name| name.eq_ignore_ascii_case(exe_name)) {
+        return Some(PathBuf::from(candidate));
+    }
+    if !candidate.is_empty() {
+        return Some(PathBuf::from(windows_join_path(&candidate, exe_name)));
     }
     None
 }
 
-#[cfg(target_os = "windows")]
-fn registry_value_from_line(line: &str) -> Option<String> {
-    let value = line
-        .split_once("REG_EXPAND_SZ")
-        .or_else(|| line.split_once("REG_SZ"))
-        .map(|(_, value)| value.trim())
-        .filter(|value| !value.is_empty())?;
-    Some(expand_windows_env_vars(value))
+#[cfg(any(target_os = "windows", test))]
+fn registry_candidate_install_dir(value: &str, exe_name: &str) -> Option<PathBuf> {
+    let candidate = registry_path_text_candidate(value);
+    if windows_path_basename(&candidate).is_some_and(|name| name.eq_ignore_ascii_case(exe_name)) {
+        return windows_path_dirname(&candidate).map(PathBuf::from);
+    }
+    Some(PathBuf::from(candidate))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
+fn registry_path_text_candidate(value: &str) -> String {
+    let normalized = value.trim().trim_matches('"');
+    let lower = normalized.to_ascii_lowercase();
+    let trimmed = if let Some(index) = lower.find(".exe,") {
+        &normalized[..index + 4]
+    } else {
+        normalized
+    };
+    trimmed.trim_matches('"').to_string()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_path_basename(value: &str) -> Option<&str> {
+    value
+        .trim_end_matches(['\\', '/'])
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_path_dirname(value: &str) -> Option<String> {
+    let trimmed = value.trim_end_matches(['\\', '/']);
+    let index = trimmed.rfind(['\\', '/'])?;
+    Some(trimmed[..index].to_string())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_join_path(dir: &str, file_name: &str) -> String {
+    let trimmed = dir.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        file_name.to_string()
+    } else {
+        format!(r"{trimmed}\{file_name}")
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn expand_windows_env_vars(value: &str) -> String {
     let mut expanded = String::with_capacity(value.len());
     let mut rest = value;
@@ -1516,6 +1946,60 @@ fn expand_windows_env_vars(value: &str) -> String {
     }
     expanded.push_str(rest);
     expanded
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn build_silent_windows_uninstall_command(record: &WindowsRegistryInstallRecord) -> Option<String> {
+    let quiet_command = record
+        .quiet_uninstall_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if quiet_command.is_some() {
+        return quiet_command.map(ToOwned::to_owned);
+    }
+
+    let command = record
+        .uninstall_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let normalized = command.to_ascii_lowercase();
+    if normalized.contains("msiexec") {
+        if let Some(product_code) = extract_windows_msi_product_code(command) {
+            return Some(format!("msiexec.exe /x {product_code} /qn /norestart"));
+        }
+        if contains_windows_command_flag(&normalized, "/quiet")
+            || contains_windows_command_flag(&normalized, "/qn")
+            || contains_windows_command_flag(&normalized, "/passive")
+        {
+            return Some(command.to_string());
+        }
+        return Some(format!("{command} /qn /norestart"));
+    }
+    if contains_windows_command_flag(&normalized, "/s") {
+        return Some(command.to_string());
+    }
+    Some(format!("{command} /S"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn extract_windows_msi_product_code(command: &str) -> Option<&str> {
+    let start = command.find('{')?;
+    let rest = &command[start..];
+    let end = rest.find('}')?;
+    let product_code = &rest[..=end];
+    product_code
+        .chars()
+        .all(|ch| ch.is_ascii_hexdigit() || matches!(ch, '{' | '}' | '-'))
+        .then_some(product_code)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn contains_windows_command_flag(command: &str, flag: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case(flag))
 }
 
 #[cfg(target_os = "windows")]
@@ -1574,7 +2058,8 @@ fn process_is_running(pid: u32, expected_target_path: Option<&Path>) -> bool {
         let ok = GetExitCodeProcess(handle, &mut exit_code);
         let path_matches = expected_target_path.is_none_or(|expected| {
             query_windows_process_image_path(handle)
-                .is_some_and(|actual| windows_paths_match(&actual, expected))
+                .map(|actual| windows_paths_match(&actual, expected))
+                .unwrap_or(true)
         });
         CloseHandle(handle);
         ok != 0 && exit_code == STILL_ACTIVE && path_matches
@@ -1582,7 +2067,9 @@ fn process_is_running(pid: u32, expected_target_path: Option<&Path>) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn query_windows_process_image_path(handle: isize) -> Option<PathBuf> {
+fn query_windows_process_image_path(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
 
@@ -1869,16 +2356,28 @@ fn cleanup_applied_update(
                 )?;
             }
             InstallRollbackPlan::Windows(rollback) => {
-                remove_file_if_exists(&rollback.backup_path).map_err(|error| {
+                fs::remove_dir_all(&rollback.backup_dir).map_err(|error| {
                     let _ = write_log_line(
                         log,
                         &format!(
                             "failed to remove Windows rollback backup {} ({error})",
-                            rollback.backup_path.display()
+                            rollback.backup_dir.display()
                         ),
                     );
                     UpdateHelperExitCode::CleanupFailed
                 })?;
+                if let Some(registry_backup) = rollback.registry_backup.as_ref() {
+                    remove_file_if_exists(&registry_backup.backup_path).map_err(|error| {
+                        let _ = write_log_line(
+                            log,
+                            &format!(
+                                "failed to remove Windows registry rollback backup {} ({error})",
+                                registry_backup.backup_path.display()
+                            ),
+                        );
+                        UpdateHelperExitCode::CleanupFailed
+                    })?;
+                }
             }
         }
     }
@@ -1919,26 +2418,315 @@ fn rollback_windows_update(
     write_log_line(
         log,
         &format!(
-            "restoring Windows executable {} from rollback backup {}",
+            "restoring Windows install directory {} for target {} from rollback backup {}",
+            rollback.install_dir.display(),
             rollback.target_path.display(),
-            rollback.backup_path.display()
+            rollback.backup_dir.display()
         ),
     )?;
-    if let Some(parent) = rollback.target_path.parent() {
-        fs::create_dir_all(parent).map_err(|_| UpdateHelperExitCode::ReplacementFailed)?;
+    best_effort_uninstall_windows_installation(rollback, log)?;
+    if rollback.install_dir.exists() {
+        fs::remove_dir_all(&rollback.install_dir).map_err(|error| {
+            let _ = write_log_line(
+                log,
+                &format!(
+                    "failed to remove partially installed Windows directory {} ({error})",
+                    rollback.install_dir.display()
+                ),
+            );
+            UpdateHelperExitCode::ReplacementFailed
+        })?;
     }
-    fs::copy(&rollback.backup_path, &rollback.target_path).map_err(|error| {
+    if let Some(parent) = rollback.install_dir.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
+            let _ = write_log_line(
+                log,
+                &format!(
+                    "failed to recreate Windows install parent directory {} ({error})",
+                    parent.display()
+                ),
+            );
+            code
+        })?;
+    }
+    copy_dir_recursive(&rollback.backup_dir, &rollback.install_dir).map_err(|error| {
+        let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
         let _ = write_log_line(
             log,
             &format!(
-                "failed to restore Windows executable {} from {} ({error})",
-                rollback.target_path.display(),
-                rollback.backup_path.display()
+                "failed to restore Windows install directory {} from {} ({error})",
+                rollback.install_dir.display(),
+                rollback.backup_dir.display()
             ),
         );
-        UpdateHelperExitCode::ReplacementFailed
+        if code == UpdateHelperExitCode::InsufficientSpace {
+            let _ = write_log_line(
+                log,
+                &format!(
+                    "rollback backup is retained at {} for manual recovery",
+                    rollback.backup_dir.display()
+                ),
+            );
+        }
+        code
     })?;
+    restore_windows_registry_backup(rollback, log)?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn best_effort_uninstall_windows_installation(
+    rollback: &WindowsRollbackPlan,
+    log: &mut File,
+) -> Result<(), UpdateHelperExitCode> {
+    let Some(exe_name) = rollback
+        .target_path
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return Ok(());
+    };
+    let Some(record) =
+        query_windows_install_record_from_registry(exe_name, Some(&rollback.target_path))
+    else {
+        write_log_line(
+            log,
+            &format!(
+                "no Windows uninstall registry entry matched {}; skipping best-effort uninstall",
+                rollback.target_path.display()
+            ),
+        )?;
+        return Ok(());
+    };
+    let Some(command_text) = build_silent_windows_uninstall_command(&record) else {
+        write_log_line(
+            log,
+            &format!(
+                "Windows uninstall registry entry {} has no usable uninstall command; continuing with file restore",
+                record.key_path
+            ),
+        )?;
+        return Ok(());
+    };
+
+    write_log_line(
+        log,
+        &format!(
+            "running best-effort Windows uninstall before rollback: key={} command={}",
+            record.key_path, command_text
+        ),
+    )?;
+    let mut child = match windows_shell_command(&command_text).spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            write_log_line(
+                log,
+                &format!(
+                    "failed to launch best-effort Windows uninstall for {} ({error}); continuing with file restore",
+                    record.key_path
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let status = match wait_for_installer_completion(&mut child, log) {
+        Ok(status) => status,
+        Err(error) => {
+            write_log_line(
+                log,
+                &format!(
+                    "best-effort Windows uninstall did not finish cleanly ({error:?}); continuing with file restore"
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    if !status.success() {
+        write_log_line(
+            log,
+            &format!(
+                "best-effort Windows uninstall exited with status {:?}; continuing with file restore",
+                status.code()
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn best_effort_uninstall_windows_installation(
+    _rollback: &WindowsRollbackPlan,
+    _log: &mut File,
+) -> Result<(), UpdateHelperExitCode> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn restore_windows_registry_backup(
+    rollback: &WindowsRollbackPlan,
+    log: &mut File,
+) -> Result<(), UpdateHelperExitCode> {
+    let Some(registry_backup) = rollback.registry_backup.as_ref() else {
+        return Ok(());
+    };
+    let status = Command::new(reg_exe_path())
+        .args(["import", &registry_backup.backup_path.to_string_lossy()])
+        .status()
+        .map_err(|error| {
+            let _ = write_log_line(
+                log,
+                &format!(
+                    "failed to import Windows uninstall registry backup {} ({error})",
+                    registry_backup.backup_path.display()
+                ),
+            );
+            UpdateHelperExitCode::ReplacementFailed
+        })?;
+    if !status.success() {
+        write_log_line(
+            log,
+            &format!(
+                "reg import failed for Windows uninstall registry backup {} with status {:?}",
+                registry_backup.backup_path.display(),
+                status.code()
+            ),
+        )?;
+        return Err(UpdateHelperExitCode::ReplacementFailed);
+    }
+    write_log_line(
+        log,
+        &format!(
+            "restored Windows uninstall registry key {} from {}",
+            registry_backup.key_path,
+            registry_backup.backup_path.display()
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_windows_registry_backup(
+    _rollback: &WindowsRollbackPlan,
+    _log: &mut File,
+) -> Result<(), UpdateHelperExitCode> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_command(command: &str) -> Command {
+    let mut process = Command::new("cmd");
+    process.args(["/C", command]);
+    process.stdin(std::process::Stdio::null());
+    process.stdout(std::process::Stdio::null());
+    process.stderr(std::process::Stdio::null());
+    process
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&source, &target)?;
+        } else {
+            fs::copy(source, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn directory_size_bytes(path: &Path) -> Result<u64, std::io::Error> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(directory_size_bytes(&entry.path())?);
+    }
+    Ok(total)
+}
+
+fn existing_probe_path(path: &Path) -> PathBuf {
+    path.ancestors()
+        .find(|candidate| candidate.exists())
+        .unwrap_or(path)
+        .to_path_buf()
+}
+
+fn fallback_bucket_key(path: &Path) -> String {
+    existing_probe_path(path).display().to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn storage_bucket_key(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    let probe = existing_probe_path(path);
+    let mut wide_path = probe.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide_path.push(0);
+    let mut buffer = vec![0u16; 32768];
+    let ok =
+        unsafe { GetVolumePathNameW(wide_path.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    if ok == 0 {
+        return None;
+    }
+    let len = buffer.iter().position(|value| *value == 0)?;
+    buffer.truncate(len);
+    Some(
+        OsString::from_wide(&buffer)
+            .to_string_lossy()
+            .to_ascii_lowercase(),
+    )
+}
+
+#[cfg(unix)]
+fn storage_bucket_key(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = existing_probe_path(path);
+    let metadata = fs::metadata(probe).ok()?;
+    Some(metadata.dev().to_string())
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn storage_bucket_key(path: &Path) -> Option<String> {
+    Some(existing_probe_path(path).display().to_string())
+}
+
+fn map_copy_error_code(
+    error: &std::io::Error,
+    fallback: UpdateHelperExitCode,
+) -> UpdateHelperExitCode {
+    if is_insufficient_space_error(error) {
+        UpdateHelperExitCode::InsufficientSpace
+    } else {
+        fallback
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_insufficient_space_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(39 | 112))
+}
+
+#[cfg(unix)]
+fn is_insufficient_space_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::ENOSPC || code == libc::EDQUOT
+    )
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn is_insufficient_space_error(_error: &std::io::Error) -> bool {
+    false
 }
 
 fn cleanup_stale_macos_stage_dirs(
@@ -2774,7 +3562,7 @@ mod tests {
         let saved_state: UpdateStateDto =
             serde_json::from_str(&fs::read_to_string(&command.state_path).expect("read state"))
                 .expect("parse state");
-        assert_eq!(action, WatchdogPostExitAction::RelaunchWithoutFailure);
+        assert_eq!(action, WatchdogPostExitAction::Noop);
         assert_eq!(saved_state.status, UpdateStatus::Installing);
         assert!(saved_state.last_error.is_none());
     }
@@ -2905,13 +3693,21 @@ mod tests {
     #[test]
     fn rollback_windows_update_restores_original_executable() {
         let root = temp_dir("helper-windows-rollback");
-        let target_path = root.join("floral-notepaper.exe");
-        let backup_path = root.join("rollback.exe");
+        let install_dir = root.join("install");
+        let backup_dir = root.join("rollback-backup");
+        let target_path = install_dir.join("floral-notepaper.exe");
+        let extra_path = install_dir.join("new-file.dll");
+        fs::create_dir_all(&install_dir).expect("create install dir");
+        fs::create_dir_all(&backup_dir).expect("create backup dir");
         fs::write(&target_path, b"new version").expect("write target");
-        fs::write(&backup_path, b"old version").expect("write backup");
+        fs::write(&extra_path, b"partial install").expect("write partial install file");
+        fs::write(backup_dir.join("floral-notepaper.exe"), b"old version").expect("write backup");
+        fs::write(backup_dir.join("stable.dll"), b"old dll").expect("write backup dll");
         let rollback = WindowsRollbackPlan {
             target_path: target_path.clone(),
-            backup_path,
+            install_dir: install_dir.clone(),
+            backup_dir: backup_dir.clone(),
+            registry_backup: None,
         };
         let mut log = open_log(&root.join("rollback.log")).expect("open log");
 
@@ -2920,6 +3716,163 @@ mod tests {
         assert_eq!(
             fs::read(&target_path).expect("read restored target"),
             b"old version"
+        );
+        assert_eq!(
+            fs::read(install_dir.join("stable.dll")).expect("read restored dll"),
+            b"old dll"
+        );
+        assert!(
+            !extra_path.exists(),
+            "partial install file should be removed"
+        );
+        assert!(
+            backup_dir.exists(),
+            "rollback backup should remain available"
+        );
+    }
+
+    #[test]
+    fn aggregates_windows_disk_space_requirements_on_same_volume() {
+        let root = temp_dir("helper-disk-space-aggregate");
+        let install_dir = root.join("install");
+        let staging_dir = root.join("staging");
+        fs::create_dir_all(&install_dir).expect("create install dir");
+        fs::create_dir_all(&staging_dir).expect("create staging dir");
+        let target_path = install_dir.join("floral-notepaper.exe");
+        fs::write(&target_path, b"old version").expect("write target");
+        fs::write(install_dir.join("stable.dll"), b"dll").expect("write install dll");
+        let mut command = helper_command(&root);
+        command.install_kind = InstallKind::WindowsNsis;
+        command.target_path = target_path;
+        command.ready_path = staging_dir.join("helper.ready");
+        command.asset_size = 10;
+        let mut log = open_log(&command.log_path).expect("open log");
+
+        let requirements =
+            aggregated_disk_space_requirements(&command, &mut log).expect("collect requirements");
+
+        assert_eq!(requirements.len(), 1);
+        let requirement = requirements.values().next().expect("single requirement");
+        assert_eq!(requirement.required_bytes, 34);
+        assert!(requirement.reasons.contains(&"installer workspace"));
+        assert!(requirement.reasons.contains(&"Windows rollback backup"));
+    }
+
+    #[test]
+    fn maps_disk_full_copy_errors_to_insufficient_space() {
+        #[cfg(target_os = "windows")]
+        let error = std::io::Error::from_raw_os_error(112);
+        #[cfg(unix)]
+        let error = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        #[cfg(not(any(unix, target_os = "windows")))]
+        let error = std::io::Error::other("disk full");
+
+        let code = map_copy_error_code(&error, UpdateHelperExitCode::ReplacementFailed);
+
+        #[cfg(any(unix, target_os = "windows"))]
+        assert_eq!(code, UpdateHelperExitCode::InsufficientSpace);
+        #[cfg(not(any(unix, target_os = "windows")))]
+        assert_eq!(code, UpdateHelperExitCode::ReplacementFailed);
+    }
+
+    #[test]
+    fn parses_windows_registry_search_output_for_matching_install_key() {
+        let output = r#"
+HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\OtherApp
+    DisplayIcon    REG_SZ    C:\Program Files\Other App\other.exe,0
+
+HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\FloralNotepaper
+    DisplayIcon    REG_SZ    C:\Program Files\Floral Notepaper\floral-notepaper.exe,0
+    InstallLocation    REG_SZ    C:\Program Files\Floral Notepaper
+"#;
+
+        let key = parse_windows_install_registry_key_from_search_output(
+            output,
+            "floral-notepaper.exe",
+            Some(Path::new(
+                r"C:\Program Files\Floral Notepaper\floral-notepaper.exe",
+            )),
+        )
+        .expect("resolve matching uninstall key");
+
+        assert_eq!(
+            key,
+            r"HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\FloralNotepaper"
+        );
+    }
+
+    #[test]
+    fn parses_windows_registry_record_for_launch_target_and_uninstall_commands() {
+        let output = r#"
+HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\FloralNotepaper
+    DisplayIcon    REG_SZ    C:\Program Files\Floral Notepaper\floral-notepaper.exe,0
+    InstallLocation    REG_SZ    C:\Program Files\Floral Notepaper
+    QuietUninstallString    REG_SZ    "C:\Program Files\Floral Notepaper\uninstall.exe" /S
+    UninstallString    REG_SZ    "C:\Program Files\Floral Notepaper\uninstall.exe"
+"#;
+
+        let record = parse_windows_install_registry_record_output(
+            output,
+            "floral-notepaper.exe",
+            Some(Path::new(
+                r"C:\Program Files\Floral Notepaper\floral-notepaper.exe",
+            )),
+        )
+        .expect("parse registry record");
+
+        assert_eq!(
+            record
+                .launch_target
+                .as_ref()
+                .map(|path| normalize_windows_path(&path.to_string_lossy())),
+            Some(normalize_windows_path(
+                r"C:\Program Files\Floral Notepaper\floral-notepaper.exe"
+            ))
+        );
+        assert_eq!(
+            record.install_dir,
+            Some(PathBuf::from(r"C:\Program Files\Floral Notepaper"))
+        );
+        assert_eq!(
+            record.quiet_uninstall_command.as_deref(),
+            Some(r#""C:\Program Files\Floral Notepaper\uninstall.exe" /S"#)
+        );
+        assert_eq!(
+            record.uninstall_command.as_deref(),
+            Some(r#""C:\Program Files\Floral Notepaper\uninstall.exe""#)
+        );
+    }
+
+    #[test]
+    fn builds_silent_windows_uninstall_command_from_registry_record() {
+        let nsis_record = WindowsRegistryInstallRecord {
+            key_path: "HKLM\\Software\\Floral".into(),
+            launch_target: Some(PathBuf::from(
+                r"C:\Program Files\Floral Notepaper\floral-notepaper.exe",
+            )),
+            install_dir: Some(PathBuf::from(r"C:\Program Files\Floral Notepaper")),
+            quiet_uninstall_command: None,
+            uninstall_command: Some(r#""C:\Program Files\Floral Notepaper\uninstall.exe""#.into()),
+        };
+        let msi_record = WindowsRegistryInstallRecord {
+            key_path: "HKLM\\Software\\FloralMsi".into(),
+            launch_target: Some(PathBuf::from(
+                r"C:\Program Files\Floral Notepaper\floral-notepaper.exe",
+            )),
+            install_dir: Some(PathBuf::from(r"C:\Program Files\Floral Notepaper")),
+            quiet_uninstall_command: None,
+            uninstall_command: Some(
+                r#"MsiExec.exe /I{ABCDEF12-3456-7890-ABCD-EF1234567890}"#.into(),
+            ),
+        };
+
+        assert_eq!(
+            build_silent_windows_uninstall_command(&nsis_record).as_deref(),
+            Some(r#""C:\Program Files\Floral Notepaper\uninstall.exe" /S"#)
+        );
+        assert_eq!(
+            build_silent_windows_uninstall_command(&msi_record).as_deref(),
+            Some(r#"msiexec.exe /x {ABCDEF12-3456-7890-ABCD-EF1234567890} /qn /norestart"#)
         );
     }
 
