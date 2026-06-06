@@ -7,6 +7,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AboutPanel } from "./AboutPanel";
 import { exportMarkdownNote, importMarkdownNote } from "../features/importExport/api";
 import { MarkdownPreview } from "../features/markdown/MarkdownPreview";
+import { showToast } from "./Toast";
 import {
   chooseNotesDirectory,
   getConfig,
@@ -285,17 +286,11 @@ export function pinTileButtonTitle(isPinned: boolean): string {
 interface MainWindowProps {
   initialSettingsOpen?: boolean;
   initialConfig?: AppConfig;
-  initialErrorMessage?: string | null;
-  initialUpdateStatus?: UpdateState | null;
-  initialAboutUpdateLabelVisible?: boolean;
 }
 
 export function MainWindow({
   initialSettingsOpen = false,
   initialConfig = undefined,
-  initialErrorMessage = null,
-  initialUpdateStatus = undefined,
-  initialAboutUpdateLabelVisible = false,
 }: MainWindowProps = {}) {
   const { t } = useTranslation();
   const [notes, setNotes] = useState<NoteMetadata[]>([]);
@@ -311,7 +306,6 @@ export function MainWindow({
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [errorMessage, setErrorMessage] = useState<string | null>(initialErrorMessage);
   const [noteMenu, setNoteMenu] = useState<NoteMenuState | null>(null);
   const [noteMenuClosing, setNoteMenuClosing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(initialSettingsOpen);
@@ -521,7 +515,6 @@ export function MainWindow({
     setTitle(note.title);
     setContent(note.content);
     setSaveState("saved");
-    setErrorMessage(null);
     setNoteTransitionKey((k) => k + 1);
   }, []);
 
@@ -538,7 +531,6 @@ export function MainWindow({
 
   const loadNote = useCallback(
     async (id: string) => {
-      setErrorMessage(null);
       const note = await getNote(id);
       applyNote(note);
       replaceNoteMetadata(note);
@@ -561,7 +553,6 @@ export function MainWindow({
   }, []);
 
   const loadExternalFile = useCallback(async (filePath: string) => {
-    setErrorMessage(null);
     try {
       const [fileContent, mtime] = await Promise.all([
         readExternalFile(filePath),
@@ -591,7 +582,7 @@ export function MainWindow({
       setNoteTransitionKey((k) => k + 1);
       externalFileMtimeRef.current = mtime;
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   }, []);
 
@@ -635,7 +626,7 @@ export function MainWindow({
           }
         }
       } catch (error) {
-        if (!cancelled) setErrorMessage(getErrorMessage(error));
+        if (!cancelled) showToast(getErrorMessage(error));
       } finally {
         if (!cancelled) setIsLoading(false);
       }
@@ -848,7 +839,7 @@ export function MainWindow({
 
   useEffect(() => {
     const unlisten = listen<string>("shortcut-register-failed", (event) => {
-      setErrorMessage(event.payload);
+      showToast(event.payload, "warning");
     });
     return () => {
       void unlisten.then((fn) => fn());
@@ -943,11 +934,10 @@ export function MainWindow({
         const mtime = await getFileModifiedTime(selectedExternalFile.filePath);
         externalFileMtimeRef.current = mtime;
         setSaveState("saved");
-        setErrorMessage(null);
         return { id: selectedId, title, content } as Note;
       } catch (error) {
         setSaveState("error");
-        setErrorMessage(getErrorMessage(error));
+        showToast(getErrorMessage(error));
         return null;
       }
     }
@@ -958,11 +948,10 @@ export function MainWindow({
       const note = await updateNote(selectedId, { title, content, category });
       replaceNoteMetadata(note);
       setSaveState("saved");
-      setErrorMessage(null);
       return note;
     } catch (error) {
       setSaveState("error");
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
       return null;
     }
   }, [
@@ -1050,7 +1039,6 @@ export function MainWindow({
   ]);
 
   const handleNewNote = async () => {
-    setErrorMessage(null);
     if (saveState === "dirty") {
       await saveCurrentNote();
     }
@@ -1059,7 +1047,7 @@ export function MainWindow({
       replaceNoteMetadata(note);
       applyNote(note);
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1071,28 +1059,24 @@ export function MainWindow({
     setSettingsOpen(true);
     setAboutOpen(false);
     if (settingsConfig) return;
-
-    setErrorMessage(null);
     try {
       const config = await getConfig();
       setSettingsConfig(config);
       setSavedNotesDir(config.notesDir);
       setViewMode(normalizeViewMode(config.defaultViewMode));
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
   const handleChooseNotesDir = async () => {
     if (!settingsConfig) return;
-
-    setErrorMessage(null);
     try {
       const notesDir = await chooseNotesDirectory();
       if (!notesDir) return;
       handleSettingsChange({ ...settingsConfig, notesDir });
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1125,7 +1109,7 @@ export function MainWindow({
             }
           }
         } catch (error) {
-          setErrorMessage(getErrorMessage(error));
+          showToast(getErrorMessage(error));
         }
       }, 300);
     },
@@ -1161,7 +1145,6 @@ export function MainWindow({
   }, []);
 
   const handleImportNote = async () => {
-    setErrorMessage(null);
     try {
       if (selectedId && saveState === "dirty") {
         const saved = await saveCurrentNote();
@@ -1174,7 +1157,7 @@ export function MainWindow({
       replaceNoteMetadata(note);
       applyNote(note);
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1189,7 +1172,7 @@ export function MainWindow({
     try {
       await loadNote(id);
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     } finally {
       setIsLoading(false);
     }
@@ -1215,11 +1198,10 @@ export function MainWindow({
       setTitle(file.title);
       setContent(fileContent);
       setSaveState("saved");
-      setErrorMessage(null);
       setNoteTransitionKey((k) => k + 1);
       externalFileMtimeRef.current = mtime;
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     } finally {
       setIsLoading(false);
     }
@@ -1248,7 +1230,6 @@ export function MainWindow({
     if (!noteId) return;
 
     setDeleteConfirm(false);
-    setErrorMessage(null);
     try {
       await deleteNote(noteId);
       const remaining = await refreshNotes();
@@ -1258,7 +1239,7 @@ export function MainWindow({
         clearCurrentNote();
       }
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1281,7 +1262,6 @@ export function MainWindow({
   };
 
   const handleExportNote = async (note: NoteMetadata) => {
-    setErrorMessage(null);
     try {
       if (note.id === selectedId && saveState === "dirty") {
         const saved = await saveCurrentNote();
@@ -1293,7 +1273,7 @@ export function MainWindow({
         title: note.id === selectedId ? title : note.title,
       });
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1318,12 +1298,11 @@ export function MainWindow({
 
   const handleMoveNote = async (noteId: string, targetCategory: string) => {
     setNoteMenuClosing(true);
-    setErrorMessage(null);
     try {
       await moveNoteCategory(noteId, targetCategory);
       await refreshNotes();
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1333,14 +1312,13 @@ export function MainWindow({
       setShowCategoryInput(false);
       return;
     }
-    setErrorMessage(null);
     try {
       await createCategory(name);
       setCategories((prev) => [...prev, name].sort());
       setShowCategoryInput(false);
       setCategoryInputValue("");
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1350,19 +1328,18 @@ export function MainWindow({
       setRenamingCategory(null);
       return;
     }
-    setErrorMessage(null);
+
     try {
       await renameCategory(oldName, newName);
       await refreshNotes();
       setRenamingCategory(null);
       setRenameCategoryValue("");
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
   const handleDeleteCategory = async (name: string) => {
-    setErrorMessage(null);
     try {
       await deleteCategory(name);
       await refreshNotes();
@@ -1370,7 +1347,7 @@ export function MainWindow({
         setActiveCategory("");
       }
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1456,11 +1433,10 @@ export function MainWindow({
   };
 
   const handleOpenNotepad = async () => {
-    setErrorMessage(null);
     try {
       await openNotepadWindow();
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1529,15 +1505,13 @@ export function MainWindow({
     if (!isPinned && saveState === "dirty") {
       await saveCurrentNote();
     }
-
-    setErrorMessage(null);
     try {
       const pinned = await toggleTileWindow(selectedId);
       setPinnedTileIds((previous) => {
         return syncPinnedTileIds(previous, selectedId, pinned);
       });
     } catch (error) {
-      setErrorMessage(getErrorMessage(error));
+      showToast(getErrorMessage(error));
     }
   };
 
@@ -1595,11 +1569,6 @@ export function MainWindow({
             </span>
           </div>
           <div className="flex items-center">
-            {errorMessage && (
-              <span className="max-w-[200px] truncate text-[11px] text-red-400 mr-2">
-                {errorMessage}
-              </span>
-            )}
             <button
               onClick={() => void handleOpenNotepad()}
               className="w-10 h-11 flex items-center justify-center text-ink-ghost hover:text-bamboo hover:bg-bamboo-mist/50 transition-all cursor-pointer"
