@@ -859,14 +859,16 @@ fn install_windows_installer(
         match effective_extension.as_str() {
             "msi" => {
                 write_log_line(log, "launching Windows MSI installer")?;
-                let mut child = Command::new("msiexec.exe")
-                    .args([
-                        "/i",
-                        &prepared_installer.installer_path.to_string_lossy(),
-                        "/passive",
-                        "/norestart",
-                    ])
-                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                let mut cmd = Command::new("msiexec.exe");
+                cmd.args([
+                    "/i",
+                    &prepared_installer.installer_path.to_string_lossy(),
+                    "/passive",
+                    "/norestart",
+                ]);
+                #[cfg(target_os = "windows")]
+                cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+                let mut child = cmd
                     .spawn()
                     .map_err(|_| UpdateHelperExitCode::InstallerFailed)?;
 
