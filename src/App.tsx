@@ -9,6 +9,17 @@ import { tabToIndentListener } from "indent-textarea";
 import { getConfig } from "./features/settings/api";
 import { applyTheme, watchSystemTheme } from "./features/settings/theme";
 import type { AppConfig, ThemeOption } from "./features/settings/types";
+
+const DEFAULT_INTERFACE_FONT = "HarmonyOS Sans SC";
+const DEFAULT_INTERFACE_BACKGROUND = "#f6f3ec";
+
+function applyInterfaceSettings(config: Pick<AppConfig, "interfaceFontFamily" | "backgroundColor">) {
+  const fontFamily = config.interfaceFontFamily?.trim() || DEFAULT_INTERFACE_FONT;
+  const backgroundColor = config.backgroundColor?.trim() || DEFAULT_INTERFACE_BACKGROUND;
+  document.documentElement.style.setProperty("--font-body", fontFamily);
+  document.documentElement.style.setProperty("--font-display", fontFamily);
+  document.documentElement.style.setProperty("--interface-background-color", backgroundColor);
+}
 import { getInitialRoute } from "./features/windows/windowRoutes";
 import { syncLanguage } from "./locales";
 import { listen } from "@tauri-apps/api/event";
@@ -28,6 +39,7 @@ function App() {
           "--tab-indent-size",
           String(config.tabIndentSize ?? 2),
         );
+        applyInterfaceSettings(config);
         void syncLanguage(config.locale);
       })
       .catch(() => {});
@@ -45,6 +57,7 @@ function App() {
         "--tab-indent-size",
         String(event.payload.tabIndentSize ?? 2),
       );
+      applyInterfaceSettings(event.payload);
       void syncLanguage(event.payload.locale);
     });
     return () => {
