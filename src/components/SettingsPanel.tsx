@@ -1,7 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { checkGlobalShortcut, chooseBackgroundImage, loadSystemFonts } from "../features/settings/api";
+import {
+  checkGlobalShortcut,
+  chooseBackgroundImage,
+  loadSystemFonts,
+} from "../features/settings/api";
 import { UpdateSettingsSection } from "../features/update/UpdateSettingsSection";
 import type {
   AppConfig,
@@ -27,6 +31,33 @@ const DEFAULT_INTERFACE_BACKGROUND = "#f6f3ec";
 
 type SettingsView = "main" | "interface";
 
+const FONT_OPTIONS_CACHE = {
+  loaded: false,
+  loading: null as Promise<string[]> | null,
+  values: [] as string[],
+};
+
+function loadCachedSystemFonts(): Promise<string[]> {
+  if (FONT_OPTIONS_CACHE.loaded) return Promise.resolve(FONT_OPTIONS_CACHE.values);
+  if (!FONT_OPTIONS_CACHE.loading) {
+    FONT_OPTIONS_CACHE.loading = loadSystemFonts()
+      .then((fonts) => {
+        FONT_OPTIONS_CACHE.values = fonts;
+        FONT_OPTIONS_CACHE.loaded = true;
+        return fonts;
+      })
+      .catch(() => {
+        FONT_OPTIONS_CACHE.values = [];
+        FONT_OPTIONS_CACHE.loaded = true;
+        return [];
+      })
+      .finally(() => {
+        FONT_OPTIONS_CACHE.loading = null;
+      });
+  }
+  return FONT_OPTIONS_CACHE.loading;
+}
+
 interface SettingsPanelProps {
   config: AppConfig;
   onChange: (config: AppConfig) => void;
@@ -37,24 +68,22 @@ interface SettingsPanelProps {
 export function SettingsPanel({ config, onChange, onMigrateDataDir, onClose }: SettingsPanelProps) {
   const { t } = useTranslation();
   const [settingsView, setSettingsView] = useState<SettingsView>("main");
-  const [fontOptions, setFontOptions] = useState<string[]>([]);
+  const [fontOptions, setFontOptions] = useState<string[]>(FONT_OPTIONS_CACHE.values);
+  const [fontOptionsRequested, setFontOptionsRequested] = useState(FONT_OPTIONS_CACHE.loaded);
   const setConfigValue = <Key extends keyof AppConfig>(key: Key, value: AppConfig[Key]) => {
     onChange({ ...config, [key]: value });
   };
 
   useEffect(() => {
+    if (!fontOptionsRequested) return;
     let cancelled = false;
-    void loadSystemFonts()
-      .then((fonts) => {
-        if (!cancelled) setFontOptions(fonts);
-      })
-      .catch(() => {
-        if (!cancelled) setFontOptions([]);
-      });
+    void loadCachedSystemFonts().then((fonts) => {
+      if (!cancelled) setFontOptions(fonts);
+    });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [fontOptionsRequested]);
   const tileColorModes = useMemo<Array<{ value: TileColorMode; label: string }>>(
     () => [
       {
@@ -136,6 +165,7 @@ export function SettingsPanel({ config, onChange, onMigrateDataDir, onClose }: S
         <InterfaceSettingsPage
           config={config}
           fontOptions={fontOptions}
+          onRequestFontOptions={() => setFontOptionsRequested(true)}
           onPatch={(patch) => onChange({ ...config, ...patch })}
         />
       </aside>
@@ -403,7 +433,6 @@ export function SettingsPanel({ config, onChange, onMigrateDataDir, onClose }: S
   );
 }
 
-
 interface NavigationRowProps {
   label: string;
   description?: string;
@@ -419,7 +448,9 @@ function NavigationRow({ label, description, onClick }: NavigationRowProps) {
     >
       <span className="min-w-0">
         <span className="block text-[12px] text-ink-soft">{label}</span>
-        {description && <span className="block text-[10px] text-ink-ghost mt-0.5">{description}</span>}
+        {description && (
+          <span className="block text-[10px] text-ink-ghost mt-0.5">{description}</span>
+        )}
       </span>
       <span className="text-[16px] text-ink-ghost ml-2">›</span>
     </button>
@@ -429,10 +460,16 @@ function NavigationRow({ label, description, onClick }: NavigationRowProps) {
 interface InterfaceSettingsPageProps {
   config: AppConfig;
   fontOptions: string[];
+  onRequestFontOptions: () => void;
   onPatch: (patch: Partial<AppConfig>) => void;
 }
 
-function InterfaceSettingsPage({ config, fontOptions, onPatch }: InterfaceSettingsPageProps) {
+function InterfaceSettingsPage({
+  config,
+  fontOptions,
+  onRequestFontOptions,
+  onPatch,
+}: InterfaceSettingsPageProps) {
   const { t } = useTranslation();
   const selectedFont = config.interfaceFontFamily || "HarmonyOS Sans SC";
   const backgroundColor = normalizeHexColor(config.backgroundColor, DEFAULT_INTERFACE_BACKGROUND);
@@ -446,6 +483,7 @@ function InterfaceSettingsPage({ config, fontOptions, onPatch }: InterfaceSettin
         <FontSelect
           value={selectedFont}
           options={fontOptions}
+          onOpen={onRequestFontOptions}
           onChange={(font) => onPatch({ interfaceFontFamily: font })}
         />
       </section>
@@ -504,10 +542,11 @@ function InterfaceSettingsPage({ config, fontOptions, onPatch }: InterfaceSettin
 interface FontSelectProps {
   value: string;
   options: string[];
+  onOpen: () => void;
   onChange: (value: string) => void;
 }
 
-function FontSelect({ value, options, onChange }: FontSelectProps) {
+function FontSelect({ value, options, onOpen, onChange }: FontSelectProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const normalizedOptions = useMemo(() => {
@@ -519,7 +558,10 @@ function FontSelect({ value, options, onChange }: FontSelectProps) {
     <div className="relative">
       <button
         type="button"
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          setOpen((current) => !current);
+          onOpen();
+        }}
         className="w-full h-9 px-2.5 rounded-lg bg-paper-warm/45 border border-paper-deep/25 flex items-center justify-between text-left cursor-pointer hover:bg-paper-warm/70 transition-colors"
       >
         <span className="min-w-0 truncate text-[12px] text-ink-soft" style={{ fontFamily: value }}>
@@ -546,7 +588,9 @@ function FontSelect({ value, options, onChange }: FontSelectProps) {
                 setOpen(false);
               }}
               className={`w-full h-8 px-2 rounded-md flex items-center justify-between text-left text-[12px] transition-colors cursor-pointer ${
-                font === value ? "bg-bamboo-mist text-bamboo" : "text-ink-soft hover:bg-paper-warm/70"
+                font === value
+                  ? "bg-bamboo-mist text-bamboo"
+                  : "text-ink-soft hover:bg-paper-warm/70"
               }`}
               style={{ fontFamily: font }}
             >
@@ -597,7 +641,10 @@ function ColorPalette({ value, onChange, onReset }: ColorPaletteProps) {
   return (
     <div className="rounded-xl border border-paper-deep/25 bg-paper-warm/35 p-3 space-y-3">
       <div className="flex items-center gap-2">
-        <div className="w-9 h-9 rounded-lg border border-paper-deep/45 shadow-inner" style={{ backgroundColor: value }} />
+        <div
+          className="w-9 h-9 rounded-lg border border-paper-deep/45 shadow-inner"
+          style={{ backgroundColor: value }}
+        />
         <input
           type="text"
           value={value}
@@ -621,7 +668,8 @@ function ColorPalette({ value, onChange, onReset }: ColorPaletteProps) {
             updateFromPointer(event, "palette");
           }}
           onPointerMove={(event) => {
-            if (event.currentTarget.hasPointerCapture(event.pointerId)) updateFromPointer(event, "palette");
+            if (event.currentTarget.hasPointerCapture(event.pointerId))
+              updateFromPointer(event, "palette");
           }}
           className="relative h-28 flex-1 rounded-lg overflow-hidden border border-paper-deep/35 cursor-crosshair"
           style={{
@@ -642,12 +690,12 @@ function ColorPalette({ value, onChange, onReset }: ColorPaletteProps) {
             updateFromPointer(event, "hue");
           }}
           onPointerMove={(event) => {
-            if (event.currentTarget.hasPointerCapture(event.pointerId)) updateFromPointer(event, "hue");
+            if (event.currentTarget.hasPointerCapture(event.pointerId))
+              updateFromPointer(event, "hue");
           }}
           className="relative w-4 h-28 rounded-full cursor-pointer border border-paper-deep/35"
           style={{
-            background:
-              "linear-gradient(to bottom, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00)",
+            background: "linear-gradient(to bottom, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00)",
           }}
         >
           <span
@@ -659,7 +707,6 @@ function ColorPalette({ value, onChange, onReset }: ColorPaletteProps) {
     </div>
   );
 }
-
 
 function BackgroundImageSettings({
   config,
@@ -823,7 +870,11 @@ function hsvToHex({ h, s, v }: HsvColor): string {
     [v, p, q],
   ][i % 6];
   return `#${[r, g, b]
-    .map((channel) => Math.round(channel * 255).toString(16).padStart(2, "0"))
+    .map((channel) =>
+      Math.round(channel * 255)
+        .toString(16)
+        .padStart(2, "0"),
+    )
     .join("")}`;
 }
 
